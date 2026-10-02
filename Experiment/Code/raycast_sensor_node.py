@@ -1,199 +1,151 @@
-import sys
 import importlib
+import os
+import sys
+import time
 from pathlib import Path
 
-import omni.usd
 import omni.graph.core as og
+import omni.usd
+
+# =============================================================
+# CONFIG
+# =============================================================
+
+MAX_RANGE = 500.0
+MIN_RANGE = 0.0
+
+# Optional override: set this env var to the folder holding
+# raycast_target_detector.py. Otherwise <stage folder>/Code is used.
+CODE_DIR_ENV = "RAYCAST_CODE_DIR"
+
+RETRY_INITIAL_S = 2.0
+RETRY_MAX_S = 30.0
 
 
 # =============================================================
 # HELPERS
 # =============================================================
 
-def normalize_targets(
-    value,
-):
-
+def normalize_targets(value):
     if value is None:
         return []
 
-    if isinstance(
-        value,
-        str,
-    ):
-
+    if isinstance(value, str):
         value = value.strip()
-
-        if not value:
-            return []
-
-        return [
-            value
-        ]
+        return [value] if value else []
 
     try:
         values = list(value)
-
     except TypeError:
+        return [str(value)]
 
-        return [
-            str(value)
-        ]
-
-    targets = []
-
-    for item in values:
-
-        item = str(
-            item
-        ).strip()
-
-        if item:
-            targets.append(
-                item
-            )
-
-    return targets
+    return [str(v).strip() for v in values if str(v).strip()]
 
 
-# =============================================================
-# IMPORT DETECTOR
-# =============================================================
+def _find_code_dir():
+    env = os.environ.get(CODE_DIR_ENV)
 
-def load_detector_class():
+    if env and Path(env).is_dir():
+        return Path(env)
 
-    stage = (
-        omni.usd
-        .get_context()
-        .get_stage()
-    )
+    stage = omni.usd.get_context().get_stage()
 
     if stage is None:
-        raise RuntimeError(
-            "Could not get active USD stage."
-        )
+        raise RuntimeError("Could not get active USD stage.")
 
-    root_layer = (
-        stage.GetRootLayer()
+    usd_path = stage.GetRootLayer().realPath
+
+    if usd_path:
+        candidate = Path(usd_path).parent / "Code"
+
+        if candidate.is_dir():
+            return candidate
+
+    raise RuntimeError(
+        "Detector code not found. Save the stage next to a 'Code' folder "
+        f"or set the {CODE_DIR_ENV} environment variable."
     )
 
-    usd_path = (
-        root_layer.realPath
-    )
 
-    if not usd_path:
+def load_detector_class():
+    code_dir = str(_find_code_dir())
 
-        raise RuntimeError(
-            "The current USD stage does not "
-            "have a valid file path."
-        )
-
-    code_dir = (
-        Path(usd_path).parent
-        / "Code"
-    )
-
-    if not code_dir.exists():
-
-        raise RuntimeError(
-            f"Code directory not found: "
-            f"{code_dir}"
-        )
-
-    code_dir_string = str(
-        code_dir
-    )
-
-    if code_dir_string not in sys.path:
-        sys.path.insert(
-            0,
-            code_dir_string,
-        )
+    if code_dir not in sys.path:
+        sys.path.insert(0, code_dir)
 
     import raycast_target_detector
 
-    raycast_target_detector = (
-        importlib.reload(
-            raycast_target_detector
-        )
+    module = importlib.reload(raycast_target_detector)
+    return module.RaycastTargetDetector
+
+
+def create_detector(sensor_paths):
+    detector = load_detector_class()(
+        sensor_paths=sensor_paths,
+        max_range=MAX_RANGE,
+        min_range=MIN_RANGE,
     )
-
-    return (
-        raycast_target_detector
-        .RaycastTargetDetector
-    )
-
-
-# =============================================================
-# CREATE DETECTOR
-# =============================================================
-
-def create_detector(
-    sensor_paths,
-):
-
-    if not sensor_paths:
-
-        raise RuntimeError(
-            "No target_front raycast sensor "
-            "paths were provided."
-        )
-
-    RaycastTargetDetector = (
-        load_detector_class()
-    )
-
-    detector = (
-        RaycastTargetDetector(
-            sensor_paths=sensor_paths,
-            max_range=500.0,
-        )
-    )
-
     detector.setup()
-
     return detector
+
+
+def _warn_once(state, message):
+    if message != state.last_warning:
+        print(f"WARNING: {message}")
+        state.last_warning = message
+
+
+def _set_output(state, name, value):
+    """Prefer numpy (no list conversion); fall back to lists if rejected."""
+    out = db_outputs = state.db_outputs
+
+    if not state.use_lists:
+        try:
+            setattr(out, name, value)
+            return
+        except Exception:
+            state.use_lists = True
+            print("Node outputs rejected numpy arrays; falling back to lists.")
+
+    setattr(out, name, value.tolist() if hasattr(value, "tolist") else value)
+
+
+def _write_empty(state):
+    _set_output(state, "distance", [])
+    state.db_outputs.num_rays = 0
+    _set_output(state, "beam_origins", [])
+    _set_output(state, "beam_end_points", [])
+
+
+def _dispose_detector(state):
+    if state.detector is not None:
+        try:
+            state.detector.cleanup()
+        except Exception:
+            pass
+
+    state.detector = None
 
 
 # =============================================================
 # SETUP
 # =============================================================
 
-def setup(
-    db: og.Database,
-):
+def setup(db: og.Database):
+    state = db.per_instance_state
 
-    state = (
-        db.per_instance_state
-    )
-
-    state.stage = (
-        omni.usd
-        .get_context()
-        .get_stage()
-    )
+    state.stage = omni.usd.get_context().get_stage()
 
     if state.stage is None:
-
-        raise RuntimeError(
-            "Could not get active USD stage."
-        )
-
-    state.target_front = None
+        raise RuntimeError("Could not get active USD stage.")
 
     state.sensor_paths = []
-
-    state.target_body_paths = []
-
     state.detector = None
-
-    state.distance = []
-
-    state.num_rays = 0
-
-    state.beam_origin = []
-
-    state.beam_endpoint = []
+    state.retry_at = 0.0
+    state.retry_delay = RETRY_INITIAL_S
+    state.last_warning = None
+    state.use_lists = False
+    state.db_outputs = db.outputs
 
     return True
 
@@ -202,242 +154,82 @@ def setup(
 # COMPUTE
 # =============================================================
 
-def compute(
-    db: og.Database,
-):
+def compute(db: og.Database):
+    state = db.per_instance_state
+    state.db_outputs = db.outputs
 
-    state = (
-        db.per_instance_state
-    )
-
-    current_sensor_paths = (
-        normalize_targets(
-            db.inputs.target_front
-        )
-    )
+    paths = normalize_targets(db.inputs.target_front)
 
     # ---------------------------------------------------------
     # No sensor paths.
     # ---------------------------------------------------------
 
-    if not current_sensor_paths:
-
-        if state.detector is not None:
-
-            try:
-                state.detector.cleanup()
-            except Exception:
-                pass
-
-        state.target_front = (
-            db.inputs.target_front
-        )
-
+    if not paths:
+        _dispose_detector(state)
         state.sensor_paths = []
-
-        state.target_body_paths = []
-
-        state.detector = None
-
-        state.distance = []
-
-        state.num_rays = 0
-
-        state.beam_origin = []
-
-        state.beam_endpoint = []
-
-        db.outputs.distance = []
-        db.outputs.num_rays = 0
-        db.outputs.beam_origins = []
-        db.outputs.beam_end_points = []
-
+        state.retry_at = 0.0
+        state.retry_delay = RETRY_INITIAL_S
+        _write_empty(state)
         return True
 
     # ---------------------------------------------------------
-    # Create / recreate detector when sensor paths change.
+    # Paths changed: reset failure backoff, drop old detector.
     # ---------------------------------------------------------
 
-    if (
-        state.detector is None
-        or
-        state.sensor_paths
-        != current_sensor_paths
-    ):
-
-        if state.detector is not None:
-
-            try:
-                state.detector.cleanup()
-            except Exception:
-                pass
-
-        try:
-
-            state.detector = (
-                create_detector(
-                    current_sensor_paths
-                )
-            )
-
-            state.sensor_paths = list(
-                current_sensor_paths
-            )
-
-            state.target_front = (
-                db.inputs.target_front
-            )
-
-            state.target_body_paths = []
-
-        except Exception as error:
-
-            print(
-                "WARNING: Could not create "
-                "raycast target detector: "
-                f"{error}"
-            )
-
-            state.detector = None
-
-            state.sensor_paths = list(
-                current_sensor_paths
-            )
-
-            state.target_body_paths = []
-
-            state.distance = []
-
-            state.num_rays = 0
-
-            state.beam_origin = []
-
-            state.beam_endpoint = []
-
-            db.outputs.distance = []
-            db.outputs.num_rays = 0
-            db.outputs.beam_origins = []
-            db.outputs.beam_end_points = []
-
-            return False
+    if paths != state.sensor_paths:
+        _dispose_detector(state)
+        state.sensor_paths = list(paths)
+        state.retry_at = 0.0
+        state.retry_delay = RETRY_INITIAL_S
+        state.last_warning = None
 
     # ---------------------------------------------------------
-    # Detector not available.
+    # Create detector (with exponential backoff on failure).
     # ---------------------------------------------------------
 
     if state.detector is None:
+        now = time.monotonic()
 
-        db.outputs.distance = []
-        db.outputs.num_rays = 0
-        db.outputs.beam_origins = []
-        db.outputs.beam_end_points = []
+        if now < state.retry_at:
+            _write_empty(state)
+            return True
 
-        return True
+        try:
+            state.detector = create_detector(paths)
+            state.retry_delay = RETRY_INITIAL_S
+            state.last_warning = None
+
+        except Exception as error:
+            _warn_once(state, f"Could not create raycast target detector: {error}")
+            state.retry_at = now + state.retry_delay
+            state.retry_delay = min(state.retry_delay * 2.0, RETRY_MAX_S)
+            _dispose_detector(state)
+            _write_empty(state)
+            return False
 
     # ---------------------------------------------------------
-    # Perform Newton raycast.
+    # Raycast.
     # ---------------------------------------------------------
 
     try:
-
-        (
-            ray_distances,
-            state.num_rays,
-            sensor_ray_counts,
-            state.beam_origin,
-            state.beam_endpoint,
-        ) = (
-            state.detector.get_results()
-        )
+        result = state.detector.get_results()
 
     except Exception as error:
+        _warn_once(state, f"Could not get raycast results: {error}")
 
-        print(
-            "WARNING: Could not get "
-            "raycast results: "
-            f"{error}"
-        )
-
-        state.distance = []
-
-        state.num_rays = 0
-
-        state.beam_origin = []
-
-        state.beam_endpoint = []
-
-        db.outputs.distance = []
-        db.outputs.num_rays = 0
-        db.outputs.beam_origins = []
-        db.outputs.beam_end_points = []
-
+        # A broken detector (e.g. model replaced mid-run) is rebuilt with backoff.
+        _dispose_detector(state)
+        state.retry_at = time.monotonic() + state.retry_delay
+        state.retry_delay = min(state.retry_delay * 2.0, RETRY_MAX_S)
+        _write_empty(state)
         return False
 
-    # ---------------------------------------------------------
-    # Convert per-ray distances to one minimum distance
-    # per sensor.
-    # ---------------------------------------------------------
+    state.last_warning = None
 
-    state.distance = []
-
-    distance_index = 0
-
-    for ray_count in (
-        sensor_ray_counts
-    ):
-
-        if ray_count <= 0:
-
-            state.distance.append(
-                500.0
-            )
-
-            continue
-
-        sensor_distances = (
-            ray_distances[
-                distance_index:
-                distance_index + ray_count
-            ]
-        )
-
-        if sensor_distances:
-
-            state.distance.append(
-                float(
-                    min(
-                        sensor_distances
-                    )
-                )
-            )
-
-        else:
-
-            state.distance.append(
-                500.0
-            )
-
-        distance_index += ray_count
-
-    # ---------------------------------------------------------
-    # Outputs.
-    # ---------------------------------------------------------
-
-    db.outputs.distance = (
-        state.distance
-    )
-
-    db.outputs.num_rays = (
-        state.num_rays
-    )
-
-    db.outputs.beam_origins = (
-        state.beam_origin
-    )
-
-    db.outputs.beam_end_points = (
-        state.beam_endpoint
-    )
+    _set_output(state, "distance", result.sensor_min)
+    db.outputs.num_rays = int(result.num_rays)
+    _set_output(state, "beam_origins", result.origins)
+    _set_output(state, "beam_end_points", result.endpoints)
 
     return True
 
@@ -446,35 +238,11 @@ def compute(
 # CLEANUP
 # =============================================================
 
-def cleanup(
-    db: og.Database,
-):
+def cleanup(db: og.Database):
+    state = db.per_instance_state
 
-    state = (
-        db.per_instance_state
-    )
-
-    if state.detector is not None:
-
-        try:
-            state.detector.cleanup()
-        except Exception:
-            pass
+    _dispose_detector(state)
 
     state.stage = None
-
-    state.target_front = None
-
     state.sensor_paths = []
-
-    state.target_body_paths = []
-
-    state.detector = None
-
-    state.distance = []
-
-    state.num_rays = 0
-
-    state.beam_origin = []
-
-    state.beam_endpoint = []
+    state.db_outputs = None
