@@ -26,22 +26,44 @@ wp.init()
 
 
 # =============================================================
-# GPU RAY PREPARATION
+# NEWTON COLLISION FLAG
+# =============================================================
+
+COLLIDE_SHAPES_FLAG = 2
+
+
+# =============================================================
+# GPU RAYCAST
 # =============================================================
 
 @wp.kernel
-def prepare_rays_kernel(
-    origins: wp.array(dtype=wp.vec3),
-    endpoints: wp.array(dtype=wp.vec3),
-    directions: wp.array(dtype=wp.vec3),
-    ray_max_distances: wp.array(dtype=wp.float32),
-    valid: wp.array(dtype=wp.int32),
+def raycast_kernel(
+    bvh_id: wp.uint64,
+    bvh_shapes_group_roots: wp.array(dtype=wp.int32),
+
+    bvh_shape_enabled: wp.array(dtype=wp.uint32),
+    shape_transform_world: wp.array(dtype=wp.transform),
+    shape_type: wp.array(dtype=wp.int32),
+    shape_scale: wp.array(dtype=wp.vec3),
+    shape_source_ptr: wp.array(dtype=wp.uint64),
+
+    ray_origins: wp.array(dtype=wp.vec3),
+    ray_endpoints: wp.array(dtype=wp.vec3),
+
+    ignored_shape_ids: wp.array(dtype=wp.int32),
+
+    out_distances: wp.array(dtype=wp.float32),
+    out_endpoints: wp.array(dtype=wp.vec3),
 ):
     ray_index = wp.tid()
 
-    origin = origins[ray_index]
+    origin = ray_origins[
+        ray_index
+    ]
 
-    endpoint = endpoints[ray_index]
+    endpoint = ray_endpoints[
+        ray_index
+    ]
 
     delta = endpoint - origin
 
@@ -55,14 +77,13 @@ def prepare_rays_kernel(
 
     if length_squared < 1.0e-16:
 
-        directions[ray_index] = wp.vec3(
-            0.0,
-            0.0,
-            0.0,
-        )
+        out_distances[
+            ray_index
+        ] = 0.0
 
-        ray_max_distances[ray_index] = 0.0
-        valid[ray_index] = 0
+        out_endpoints[
+            ray_index
+        ] = origin
 
         return
 
@@ -70,112 +91,50 @@ def prepare_rays_kernel(
         length_squared
     )
 
-    inverse_length = (
-        1.0 / ray_length
+    direction = (
+        delta / ray_length
     )
 
-    directions[ray_index] = (
-        delta * inverse_length
-    )
-
-    ray_max_distances[ray_index] = (
-        ray_length
-    )
-
-    valid[ray_index] = 1
-
-
-# =============================================================
-# GPU FILTERED RAYCAST
-# =============================================================
-#
-# This follows Newton's BVH raycast traversal but adds one
-# early shape-ID filter before performing the expensive geometry
-# intersection.
-#
-# The original Newton BVH is used unchanged.
-# =============================================================
-
-@wp.kernel
-def intersect_filtered_rays_kernel(
-    bvh_id: wp.uint64,
-    bvh_shapes_group_roots: wp.array(dtype=wp.int32),
-    bvh_shape_enabled: wp.array(dtype=wp.uint32),
-    shape_transform_world: wp.array(dtype=wp.transform),
-    shape_type: wp.array(dtype=wp.int32),
-    shape_scale: wp.array(dtype=wp.vec3),
-    shape_source_ptr: wp.array(dtype=wp.uint64),
-
-    ray_origins: wp.array(dtype=wp.vec3),
-    ray_directions: wp.array(dtype=wp.vec3),
-    ray_worlds: wp.array(dtype=wp.int32),
-
-    ignored_shape_ids: wp.array(dtype=wp.int32),
-
-    out_dist: wp.array(dtype=wp.float32),
-    out_shape_id: wp.array(dtype=wp.int32),
-):
-    ray_index = wp.tid()
-
-    origin = ray_origins[
-        ray_index
-    ]
-
-    direction = ray_directions[
-        ray_index
-    ]
-
-    min_dist = float(
-        MAXVAL
-    )
+    min_dist = ray_length
 
     min_shape_id = wp.int32(
         -1
     )
 
     # ---------------------------------------------------------
-    # Query:
+    # Always read the CURRENT Newton BVH roots.
     #
-    # 1. The ray's own world.
-    # 2. The global world.
+    # The model BVH may be rebuilt by another detector instance
+    # when another robot is duplicated.
     # ---------------------------------------------------------
 
-    for world_pass in range(
-        wp.static(2)
-    ):
+    world_bvh_root = (
+        bvh_shapes_group_roots[
+            0
+        ]
+    )
 
-        if world_pass == 0:
-
-            group_id = (
-                ray_worlds[
-                    ray_index
-                ]
-            )
-
-        else:
-
-            group_id = (
-                bvh_shapes_group_roots.shape[
-                    0
-                ]
-                -
-                1
-            )
-
-        bvh_root = (
-            bvh_shapes_group_roots[
-                group_id
+    global_bvh_root = (
+        bvh_shapes_group_roots[
+            bvh_shapes_group_roots.shape[
+                0
             ]
-        )
+            -
+            1
+        ]
+    )
 
-        if bvh_root < 0:
-            continue
+    # ---------------------------------------------------------
+    # World BVH.
+    # ---------------------------------------------------------
+
+    if world_bvh_root >= 0:
 
         query = wp.bvh_query_ray(
             bvh_id,
             origin,
             direction,
-            bvh_root,
+            world_bvh_root,
         )
 
         bvh_shape_id = wp.int32(
@@ -194,11 +153,6 @@ def intersect_filtered_rays_kernel(
                 ]
             )
 
-            # -------------------------------------------------
-            # Skip ignored articulation shapes before doing
-            # any geometry intersection work.
-            # -------------------------------------------------
-
             if (
                 ignored_shape_ids[
                     shape_id
@@ -212,10 +166,6 @@ def intersect_filtered_rays_kernel(
                     shape_id
                 ]
             )
-
-            # -------------------------------------------------
-            # Mesh geometry.
-            # -------------------------------------------------
 
             if (
                 geom_type
@@ -253,7 +203,7 @@ def intersect_filtered_rays_kernel(
 
                 (
                     hit_dist,
-                    hit_normal_local,
+                    _hit_normal_local,
                     _u,
                     _v,
                     _face,
@@ -272,21 +222,21 @@ def intersect_filtered_rays_kernel(
                     )
                 )
 
-                if hit_dist >= 0.0:
+                if (
+                    hit_dist >= 0.0
+                    and
+                    hit_dist <= ray_length
+                    and
+                    hit_dist < min_dist
+                ):
 
-                    if hit_dist < min_dist:
+                    min_dist = (
+                        hit_dist
+                    )
 
-                        min_dist = (
-                            hit_dist
-                        )
-
-                        min_shape_id = (
-                            shape_id
-                        )
-
-            # -------------------------------------------------
-            # Analytic geometry.
-            # -----------------------------------------------------
+                    min_shape_id = (
+                        shape_id
+                    )
 
             else:
 
@@ -308,133 +258,203 @@ def intersect_filtered_rays_kernel(
                     )
                 )
 
-                if hit_dist >= 0.0:
+                if (
+                    hit_dist >= 0.0
+                    and
+                    hit_dist <= ray_length
+                    and
+                    hit_dist < min_dist
+                ):
 
-                    if hit_dist < min_dist:
+                    min_dist = (
+                        hit_dist
+                    )
 
-                        min_dist = (
-                            hit_dist
-                        )
+                    min_shape_id = (
+                        shape_id
+                    )
 
-                        min_shape_id = (
+    # ---------------------------------------------------------
+    # Global BVH.
+    # ---------------------------------------------------------
+
+    if (
+        global_bvh_root >= 0
+        and
+        global_bvh_root != world_bvh_root
+    ):
+
+        query = wp.bvh_query_ray(
+            bvh_id,
+            origin,
+            direction,
+            global_bvh_root,
+        )
+
+        bvh_shape_id = wp.int32(
+            0
+        )
+
+        while wp.bvh_query_next(
+            query,
+            bvh_shape_id,
+            min_dist,
+        ):
+
+            shape_id = wp.int32(
+                bvh_shape_enabled[
+                    bvh_shape_id
+                ]
+            )
+
+            if (
+                ignored_shape_ids[
+                    shape_id
+                ] != 0
+            ):
+
+                continue
+
+            geom_type = (
+                shape_type[
+                    shape_id
+                ]
+            )
+
+            if (
+                geom_type
+                ==
+                GeoType.MESH
+                or
+                geom_type
+                ==
+                GeoType.CONVEX_MESH
+                or
+                geom_type
+                ==
+                GeoType.HFIELD
+            ):
+
+                geom_to_world = (
+                    shape_transform_world[
+                        shape_id
+                    ]
+                )
+
+                (
+                    ray_origin_local,
+                    ray_direction_local,
+                ) = (
+                    map_ray_to_local(
+                        geom_to_world,
+                        origin,
+                        direction,
+                        shape_scale[
                             shape_id
-                        )
+                        ],
+                    )
+                )
 
-    out_dist[
-        ray_index
-    ] = wp.where(
-        min_shape_id < 0,
-        -1.0,
-        min_dist,
-    )
+                (
+                    hit_dist,
+                    _hit_normal_local,
+                    _u,
+                    _v,
+                    _face,
+                ) = (
+                    ray_intersect_mesh(
+                        ray_origin_local,
+                        ray_direction_local,
+                        shape_scale[
+                            shape_id
+                        ],
+                        shape_source_ptr[
+                            shape_id
+                        ],
+                        False,
+                        min_dist,
+                    )
+                )
 
-    out_shape_id[
-        ray_index
-    ] = (
-        min_shape_id
-    )
+                if (
+                    hit_dist >= 0.0
+                    and
+                    hit_dist <= ray_length
+                    and
+                    hit_dist < min_dist
+                ):
 
+                    min_dist = (
+                        hit_dist
+                    )
 
-# =============================================================
-# GPU HIT RESOLUTION
-# =============================================================
+                    min_shape_id = (
+                        shape_id
+                    )
 
-@wp.kernel
-def resolve_hits_kernel(
-    origins: wp.array(dtype=wp.vec3),
-    directions: wp.array(dtype=wp.vec3),
-    ray_max_distances: wp.array(dtype=wp.float32),
-    ray_valid: wp.array(dtype=wp.int32),
+            else:
 
-    hit_distances: wp.array(dtype=wp.float32),
-    hit_shape_ids: wp.array(dtype=wp.int32),
+                (
+                    hit_dist,
+                    _hit_normal,
+                ) = (
+                    ray_intersect_shape(
+                        shape_transform_world[
+                            shape_id
+                        ],
+                        shape_scale[
+                            shape_id
+                        ],
+                        geom_type,
+                        origin,
+                        direction,
+                        False,
+                    )
+                )
 
-    out_distances: wp.array(dtype=wp.float32),
-    out_endpoints: wp.array(dtype=wp.vec3),
-):
-    ray_index = wp.tid()
+                if (
+                    hit_dist >= 0.0
+                    and
+                    hit_dist <= ray_length
+                    and
+                    hit_dist < min_dist
+                ):
 
-    origin = origins[
-        ray_index
-    ]
+                    min_dist = (
+                        hit_dist
+                    )
 
-    direction = directions[
-        ray_index
-    ]
+                    min_shape_id = (
+                        shape_id
+                    )
 
-    max_distance = (
-        ray_max_distances[
-            ray_index
-        ]
-    )
+    # ---------------------------------------------------------
+    # Final output.
+    # ---------------------------------------------------------
 
-    if ray_valid[
-        ray_index
-    ] == 0:
+    if min_shape_id < 0:
 
         out_distances[
             ray_index
-        ] = max_distance
+        ] = ray_length
 
         out_endpoints[
             ray_index
-        ] = origin
+        ] = endpoint
 
-        return
-
-    hit_distance = (
-        hit_distances[
-            ray_index
-        ]
-    )
-
-    shape_id = (
-        hit_shape_ids[
-            ray_index
-        ]
-    )
-
-    hit_is_valid = 1
-
-    if hit_distance < 0.0:
-
-        hit_is_valid = 0
-
-    if hit_distance > max_distance:
-
-        hit_is_valid = 0
-
-    if shape_id < 0:
-
-        hit_is_valid = 0
-
-    if hit_is_valid == 0:
+    else:
 
         out_distances[
             ray_index
-        ] = max_distance
+        ] = min_dist
 
         out_endpoints[
             ray_index
         ] = (
             origin
             +
-            direction * max_distance
+            direction * min_dist
         )
-
-        return
-
-    out_distances[
-        ray_index
-    ] = hit_distance
-
-    out_endpoints[
-        ray_index
-    ] = (
-        origin
-        +
-        direction * hit_distance
-    )
 
 
 # =============================================================
@@ -495,17 +515,6 @@ class RaycastTargetDetector:
 
         self.gpu_ray_origins = None
         self.gpu_ray_endpoints = None
-        self.gpu_ray_directions = None
-        self.gpu_ray_max_distances = None
-        self.gpu_ray_valid = None
-        self.gpu_ray_worlds = None
-
-        # -----------------------------------------------------
-        # Newton outputs
-        # -----------------------------------------------------
-
-        self.gpu_hit_distances = None
-        self.gpu_hit_shape_ids = None
 
         # -----------------------------------------------------
         # Final outputs
@@ -539,6 +548,7 @@ class RaycastTargetDetector:
                 or
                 not prim.IsValid()
             ):
+
                 continue
 
             current = prim
@@ -601,6 +611,59 @@ class RaycastTargetDetector:
         return False
 
     # =========================================================
+    # USD COLLISION ENABLED TEST
+    # =========================================================
+
+    def _is_usd_collision_enabled(
+        self,
+        path,
+    ):
+
+        prim = (
+            self.stage.GetPrimAtPath(
+                path
+            )
+        )
+
+        if (
+            not prim
+            or
+            not prim.IsValid()
+        ):
+
+            return True
+
+        if not prim.HasAPI(
+            UsdPhysics.CollisionAPI
+        ):
+
+            return True
+
+        collision_api = (
+            UsdPhysics.CollisionAPI(
+                prim
+            )
+        )
+
+        attr = (
+            collision_api.GetCollisionEnabledAttr()
+        )
+
+        if not attr:
+
+            return True
+
+        value = attr.Get()
+
+        if value is None:
+
+            return True
+
+        return bool(
+            value
+        )
+
+    # =========================================================
     # SHAPE FILTER
     # =========================================================
 
@@ -650,45 +713,136 @@ class RaycastTargetDetector:
             None,
         )
 
-        ignored_count = 0
+        collision_groups = getattr(
+            self.model,
+            "shape_collision_group",
+            None,
+        )
 
-        if labels is not None:
+        ignored_count = 0
+        usd_disabled_count = 0
+        group_disabled_count = 0
+        articulation_ignored_count = 0
+
+        collision_group_values = None
+
+        if collision_groups is not None:
 
             try:
 
-                label_count = min(
-                    len(labels),
-                    shape_count,
+                collision_group_values = (
+                    collision_groups.numpy()
                 )
 
-            except TypeError:
+            except Exception:
 
-                label_count = 0
+                try:
 
-            for shape_index in range(
-                label_count
+                    collision_group_values = (
+                        np.asarray(
+                            collision_groups
+                        )
+                    )
+
+                except Exception:
+
+                    collision_group_values = None
+
+        for shape_index in range(
+            shape_count
+        ):
+
+            should_ignore = False
+
+            if (
+                collision_group_values is not None
+                and
+                shape_index
+                <
+                len(collision_group_values)
             ):
 
                 try:
 
-                    label = labels[
-                        shape_index
-                    ]
+                    collision_group = int(
+                        collision_group_values[
+                            shape_index
+                        ]
+                    )
 
-                    if (
-                        self._is_under_ignored_articulation(
-                            label
+                    if collision_group == 0:
+
+                        should_ignore = True
+
+                        group_disabled_count += 1
+
+                except Exception:
+
+                    pass
+
+            shape_path = None
+
+            if labels is not None:
+
+                try:
+
+                    if shape_index < len(labels):
+
+                        shape_path = labels[
+                            shape_index
+                        ]
+
+                except Exception:
+
+                    shape_path = None
+
+            if (
+                shape_path is not None
+            ):
+
+                try:
+
+                    if not (
+                        self._is_usd_collision_enabled(
+                            shape_path
                         )
                     ):
 
-                        ignored[
-                            shape_index
-                        ] = 1
+                        should_ignore = True
 
-                        ignored_count += 1
+                        usd_disabled_count += 1
 
                 except Exception:
-                    continue
+
+                    pass
+
+            if (
+                shape_path is not None
+            ):
+
+                try:
+
+                    if (
+                        self._is_under_ignored_articulation(
+                            shape_path
+                        )
+                    ):
+
+                        should_ignore = True
+
+                        articulation_ignored_count += 1
+
+                except Exception:
+
+                    pass
+
+            if should_ignore:
+
+                ignored[
+                    shape_index
+                ] = 1
+
+                ignored_count += 1
 
         self.gpu_ignored_shape_ids = (
             wp.array(
@@ -704,17 +858,78 @@ class RaycastTargetDetector:
             "shape(s) marked as ignored."
         )
 
+        print(
+            "  Collision group disabled: "
+            f"{group_disabled_count}"
+        )
+
+        print(
+            "  USD collision disabled: "
+            f"{usd_disabled_count}"
+        )
+
+        print(
+            "  Sensor articulation: "
+            f"{articulation_ignored_count}"
+        )
+
         if (
-            self.ignored_articulation_roots
-            and
-            ignored_count == 0
+            collision_groups is None
         ):
 
             print(
-                "WARNING: No Newton shape labels "
-                "matched the sensor articulation roots. "
-                "Self-shape filtering may be inactive."
+                "WARNING: Newton model does not "
+                "provide shape_collision_group."
             )
+
+    # =========================================================
+    # BUILD RAYCAST BVH
+    # =========================================================
+
+    def _build_raycast_bvh(
+        self,
+    ):
+
+        if self.model is None:
+
+            raise RuntimeError(
+                "Newton model is not available."
+            )
+
+        if self.state is None:
+
+            raise RuntimeError(
+                "Newton state is not available."
+            )
+
+        if not hasattr(
+            self.model,
+            "bvh_build_shapes",
+        ):
+
+            raise RuntimeError(
+                "Newton model does not provide "
+                "bvh_build_shapes()."
+            )
+
+        self.model.bvh_build_shapes(
+            self.state,
+            bvh_constructor="sah",
+            shape_flags=COLLIDE_SHAPES_FLAG,
+        )
+
+        bvh_shape_count = int(
+            getattr(
+                self.model,
+                "bvh_shape_count_enabled",
+                0,
+            )
+        )
+
+        print(
+            "Newton raycast BVH rebuilt: "
+            f"{bvh_shape_count} collision shape(s)."
+        )
 
     # =========================================================
     # REFRESH NEWTON REFERENCES
@@ -787,10 +1002,12 @@ class RaycastTargetDetector:
 
             print(
                 "Newton model changed. "
-                "Refreshing shape filter."
+                "Refreshing collision filter and BVH."
             )
 
             self._build_ignored_shape_mask()
+
+            self._build_raycast_bvh()
 
     # =========================================================
     # SENSOR RAY DATA
@@ -1038,54 +1255,6 @@ class RaycastTargetDetector:
             )
         )
 
-        self.gpu_ray_directions = (
-            wp.zeros(
-                new_capacity,
-                dtype=wp.vec3,
-                device=self.wp_device,
-            )
-        )
-
-        self.gpu_ray_max_distances = (
-            wp.zeros(
-                new_capacity,
-                dtype=wp.float32,
-                device=self.wp_device,
-            )
-        )
-
-        self.gpu_ray_valid = (
-            wp.zeros(
-                new_capacity,
-                dtype=wp.int32,
-                device=self.wp_device,
-            )
-        )
-
-        self.gpu_ray_worlds = (
-            wp.zeros(
-                new_capacity,
-                dtype=wp.int32,
-                device=self.wp_device,
-            )
-        )
-
-        self.gpu_hit_distances = (
-            wp.zeros(
-                new_capacity,
-                dtype=wp.float32,
-                device=self.wp_device,
-            )
-        )
-
-        self.gpu_hit_shape_ids = (
-            wp.zeros(
-                new_capacity,
-                dtype=wp.int32,
-                device=self.wp_device,
-            )
-        )
-
         self.gpu_distances = (
             wp.zeros(
                 new_capacity,
@@ -1149,10 +1318,6 @@ class RaycastTargetDetector:
             ray_count
         )
 
-        # -----------------------------------------------------
-        # Upload sensor rays.
-        # -----------------------------------------------------
-
         self.gpu_ray_origins[
             :ray_count
         ].assign(
@@ -1165,52 +1330,8 @@ class RaycastTargetDetector:
             ray_endpoints
         )
 
-        # -----------------------------------------------------
-        # Newton world.
-        # -----------------------------------------------------
-
-        self.gpu_ray_worlds[
-            :ray_count
-        ].fill_(
-            0
-        )
-
-        # -----------------------------------------------------
-        # Normalize rays.
-        # -----------------------------------------------------
-
         wp.launch(
-            kernel=prepare_rays_kernel,
-            dim=ray_count,
-            inputs=[
-                self.gpu_ray_origins[
-                    :ray_count
-                ],
-                self.gpu_ray_endpoints[
-                    :ray_count
-                ],
-                self.gpu_ray_directions[
-                    :ray_count
-                ],
-                self.gpu_ray_max_distances[
-                    :ray_count
-                ],
-                self.gpu_ray_valid[
-                    :ray_count
-                ],
-            ],
-            device=self.wp_device,
-        )
-
-        # -----------------------------------------------------
-        # Filtered Newton BVH ray query.
-        #
-        # Uses the EXISTING Newton BVH.
-        # Robot shapes are skipped before geometry intersection.
-        # -----------------------------------------------------
-
-        wp.launch(
-            kernel=intersect_filtered_rays_kernel,
+            kernel=raycast_kernel,
             dim=ray_count,
             inputs=[
                 self.model.bvh_shapes.id,
@@ -1223,49 +1344,10 @@ class RaycastTargetDetector:
                 self.gpu_ray_origins[
                     :ray_count
                 ],
-                self.gpu_ray_directions[
-                    :ray_count
-                ],
-                self.gpu_ray_worlds[
+                self.gpu_ray_endpoints[
                     :ray_count
                 ],
                 self.gpu_ignored_shape_ids,
-                self.gpu_hit_distances[
-                    :ray_count
-                ],
-                self.gpu_hit_shape_ids[
-                    :ray_count
-                ],
-            ],
-            device=self.wp_device,
-        )
-
-        # -----------------------------------------------------
-        # Resolve hit distances and endpoints.
-        # -----------------------------------------------------
-
-        wp.launch(
-            kernel=resolve_hits_kernel,
-            dim=ray_count,
-            inputs=[
-                self.gpu_ray_origins[
-                    :ray_count
-                ],
-                self.gpu_ray_directions[
-                    :ray_count
-                ],
-                self.gpu_ray_max_distances[
-                    :ray_count
-                ],
-                self.gpu_ray_valid[
-                    :ray_count
-                ],
-                self.gpu_hit_distances[
-                    :ray_count
-                ],
-                self.gpu_hit_shape_ids[
-                    :ray_count
-                ],
                 self.gpu_distances[
                     :ray_count
                 ],
@@ -1386,10 +1468,6 @@ class RaycastTargetDetector:
                 "Could not acquire Newton stage."
             )
 
-        # -----------------------------------------------------
-        # Access Newton model.
-        # -----------------------------------------------------
-
         self.model = (
             self.newton_stage.model
         )
@@ -1417,24 +1495,11 @@ class RaycastTargetDetector:
             )
         )
 
-        bvh_shapes = getattr(
-            self.model,
-            "bvh_shapes",
-            None,
-        )
-
         print(
             "Newton model ready: "
             f"{shape_count} shape(s), "
             f"{world_count} world(s)."
         )
-
-        if bvh_shapes is None:
-
-            raise RuntimeError(
-                "Newton model does not contain "
-                "a shape BVH."
-            )
 
         # -----------------------------------------------------
         # Current Newton state.
@@ -1460,11 +1525,23 @@ class RaycastTargetDetector:
                 self.model.state()
             )
 
+        if self.state is None:
+
+            raise RuntimeError(
+                "Could not obtain current Newton state."
+            )
+
         # -----------------------------------------------------
-        # Build self-collision exclusion mask.
+        # Build collision filter.
         # -----------------------------------------------------
 
         self._build_ignored_shape_mask()
+
+        # -----------------------------------------------------
+        # Build collision-only raycast BVH.
+        # -----------------------------------------------------
+
+        self._build_raycast_bvh()
 
         return True
 
@@ -1475,14 +1552,6 @@ class RaycastTargetDetector:
     def get_results(
         self,
     ):
-
-        # -----------------------------------------------------
-        # Always acquire the current Newton simulation objects.
-        #
-        # Stop -> Play can replace the Newton model/state.
-        # Refreshing these references here prevents this detector
-        # from continuing to use the previous simulation model.
-        # -----------------------------------------------------
 
         self._refresh_newton_references()
 
@@ -1505,8 +1574,7 @@ class RaycastTargetDetector:
             )
 
         # -----------------------------------------------------
-        # Refit the EXISTING shape BVH using the current
-        # Newton body transforms.
+        # Refit the existing BVH.
         # -----------------------------------------------------
 
         if self.state is not None:
@@ -1516,7 +1584,7 @@ class RaycastTargetDetector:
             )
 
         # -----------------------------------------------------
-        # Perform Newton raycast.
+        # Perform raycast.
         # -----------------------------------------------------
 
         (
@@ -1602,13 +1670,6 @@ class RaycastTargetDetector:
 
         self.gpu_ray_origins = None
         self.gpu_ray_endpoints = None
-        self.gpu_ray_directions = None
-        self.gpu_ray_max_distances = None
-        self.gpu_ray_valid = None
-        self.gpu_ray_worlds = None
-
-        self.gpu_hit_distances = None
-        self.gpu_hit_shape_ids = None
 
         self.gpu_distances = None
         self.gpu_endpoints = None
